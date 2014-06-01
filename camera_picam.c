@@ -38,6 +38,14 @@ struct internal
     char *current_port_desc;
     char *current_speed_desc;
     char *current_gain_desc;
+
+    bool current_port_is_em;
+    double current_em_gain;
+
+    uint16_t exposure_shortcut_ms;
+    double vertical_shift_us;
+
+    double readout_time;
 };
 
 static void log_picam_error(PicamError error)
@@ -170,10 +178,19 @@ static void acquired_frame(struct internal *internal, uint8_t *frame_data, uint6
             frame->timestamp = timestamp*1.0/internal->timestamp_resolution;
             frame->has_image_region = false;
             frame->has_bias_region = false;
+            frame->readout_time = internal->readout_time;
+            frame->vertical_shift_us = internal->vertical_shift_us;
 
             frame->port_desc = strdup(internal->current_port_desc);
             frame->speed_desc = strdup(internal->current_speed_desc);
             frame->gain_desc = strdup(internal->current_gain_desc);
+
+            frame->has_em_gain = internal->current_port_is_em;
+            frame->em_gain = internal->current_em_gain;
+
+            frame->has_exposure_shortcut = true;
+            frame->exposure_shortcut_ms = internal->exposure_shortcut_ms;
+
             queue_framedata(frame);
         }
         else
@@ -301,12 +318,6 @@ int camera_picam_initialize(Camera *camera, void **out_internal)
     // Set initial temperature
     set_float_param(internal->model_handle, PicamParameter_SensorTemperatureSetPoint, pn_preference_int(CAMERA_TEMPERATURE)/100.0f);
 
-    // Enable frame transfer mode
-    set_integer_param(internal->model_handle, PicamParameter_ReadoutControlMode, PicamReadoutControlMode_FrameTransfer);
-
-    // Enable external trigger
-    set_integer_param(internal->model_handle, PicamParameter_TriggerResponse, PicamTriggerResponse_ReadoutPerTrigger);
-
     // Set falling edge trigger (actually low level trigger)
     set_integer_param(internal->model_handle, PicamParameter_TriggerDetermination, PicamTriggerDetermination_FallingEdge);
 
@@ -324,7 +335,8 @@ int camera_picam_initialize(Camera *camera, void **out_internal)
     set_integer_param(internal->model_handle, PicamParameter_TimeStamps, PicamTimeStampsMask_ExposureStarted);
 
     // Set Electron-Multiplication gain.
-    set_integer_param(internal->model_handle, PicamParameter_AdcEMGain, pn_preference_int(PROEM_EM_GAIN));
+    internal->current_em_gain = pn_preference_int(PROEM_EM_GAIN);
+    set_integer_param(internal->model_handle, PicamParameter_AdcEMGain, internal->current_em_gain);
     pn_log("Set EM Gain to %u", pn_preference_int(PROEM_EM_GAIN));
 
     // Validate and set vertical shift rate
@@ -349,6 +361,7 @@ int camera_picam_initialize(Camera *camera, void **out_internal)
                     shift_constraint->values_array[shift_id]);
 
     pn_log("Set vertical shift rate to %gus", shift_constraint->values_array[shift_id]);
+    internal->vertical_shift_us = shift_constraint->values_array[shift_id];
     Picam_DestroyCollectionConstraints(shift_constraint);
 
     pi64s timestamp_resolution;
@@ -397,6 +410,23 @@ int camera_picam_update_camera_settings(Camera *camera, void *_internal, double 
     struct internal *internal = _internal;
     PicamError error;
 
+    // Enable frame transfer mode
+    PicamReadoutControlMode readout_type = PicamReadoutControlMode_FrameTransfer;
+
+    // Enable external trigger
+    PicamTriggerResponse trigger_type = PicamTriggerResponse_ReadoutPerTrigger;
+
+    // If bias mode is enabled, then we want a fullframe readout with internal triggering
+    uint8_t trigger_mode = pn_preference_char(TIMER_TRIGGER_MODE);
+    if (trigger_mode == TRIGGER_BIAS)
+    {
+        readout_type = PicamReadoutControlMode_FullFrame;
+        trigger_type = PicamTriggerResponse_NoResponse;
+    }
+
+    set_integer_param(internal->model_handle, PicamParameter_ReadoutControlMode, readout_type);
+    set_integer_param(internal->model_handle, PicamParameter_TriggerResponse, trigger_type);
+
     // Validate and set readout port
     const PicamCollectionConstraint *port_constraint;
     error = Picam_GetParameterCollectionConstraint(internal->model_handle, PicamParameter_AdcQuality,
@@ -422,6 +452,7 @@ int camera_picam_update_camera_settings(Camera *camera, void *_internal, double 
     free(internal->current_port_desc);
     Picam_GetEnumerationString(PicamEnumeratedType_AdcQuality, port_constraint->values_array[port_id], &value);
     internal->current_port_desc = strdup(value);
+    internal->current_port_is_em = port_constraint->values_array[port_id] == PicamAdcQuality_ElectronMultiplied;
     Picam_DestroyString(value);
 
     Picam_DestroyCollectionConstraints(port_constraint);
@@ -479,7 +510,7 @@ int camera_picam_update_camera_settings(Camera *camera, void *_internal, double 
                       (piint)(gain_constraint->values_array[gain_id]));
 
     free(internal->current_gain_desc);
-    Picam_GetEnumerationString(PicamParameter_AdcAnalogGain, gain_constraint->values_array[gain_id], &value);
+    Picam_GetEnumerationString(PicamEnumeratedType_AdcAnalogGain, gain_constraint->values_array[gain_id], &value);
     internal->current_gain_desc = strdup(value);
     Picam_DestroyString(value);
 
@@ -590,28 +621,33 @@ int camera_picam_update_camera_settings(Camera *camera, void *_internal, double 
         log_picam_error(error);
         return CAMERA_ERROR;
     }
+
+    internal->readout_time = readout_time / 1000;
     double exposure_time = pn_preference_int(EXPOSURE_TIME);
-    bool highres = pn_preference_char(TIMER_HIGHRES_TIMING);
     double shortcut = pn_preference_int(PROEM_EXPOSURE_SHORTCUT);
+    internal->exposure_shortcut_ms = shortcut;
 
     // Convert times from to the base exposure unit (s or ms) for comparison
-    if (!highres)
+    if (trigger_mode == TRIGGER_SECONDS)
     {
         shortcut /= 1000;
         readout_time /= 1000;
     }
 
     // Make sure that the shortened exposure is physically possible
-    exposure_time -= shortcut;
-    if (exposure_time <= readout_time)
+    if (trigger_mode != TRIGGER_BIAS)
     {
-        uint16_t new_exposure = (uint16_t)(ceil(readout_time + shortcut));
-        pn_preference_set_int(EXPOSURE_TIME, new_exposure);
-        pn_log("EXPOSURE_TIME - PROEM_EXPOSURE_SHORTCUT > camera readout.");
-        pn_log("Increasing EXPOSURE_TIME to %d.", new_exposure);
+        exposure_time -= shortcut;
+        if (exposure_time <= readout_time)
+        {
+            uint16_t new_exposure = (uint16_t)(ceil(readout_time + shortcut));
+            pn_preference_set_int(EXPOSURE_TIME, new_exposure);
+            pn_log("EXPOSURE_TIME - PROEM_EXPOSURE_SHORTCUT > camera readout.");
+            pn_log("Increasing EXPOSURE_TIME to %d.", new_exposure);
+        }
     }
 
-    *out_readout_time = highres ? readout_time / 1000 : readout_time;
+    *out_readout_time = internal->readout_time;
     return CAMERA_OK;
 }
 
@@ -769,14 +805,19 @@ int camera_picam_start_acquiring(Camera *camera, void *_internal, bool shutter_o
     }
     internal->frame_bytes = frame_size;
 
-    // Convert from base exposure units (s or ms) to ms
-    piflt exptime = pn_preference_int(EXPOSURE_TIME);
-    if (!pn_preference_char(TIMER_HIGHRES_TIMING))
-        exptime *= 1000;
+    // Exposure time is zero for bias frames
+    piflt exptime = 0;
+    if (pn_preference_char(TIMER_TRIGGER_MODE) != TRIGGER_BIAS)
+    {
+        // Convert from base exposure units (s or ms) to ms
+        exptime = pn_preference_int(EXPOSURE_TIME);
+        if (pn_preference_char(TIMER_TRIGGER_MODE) == TRIGGER_SECONDS)
+            exptime *= 1000;
 
-    // Set exposure period shorter than the trigger period, allowing
-    // the camera to complete the frame transfer and be ready for the next trigger
-    exptime -= pn_preference_int(PROEM_EXPOSURE_SHORTCUT);
+        // Set exposure period shorter than the trigger period, allowing
+        // the camera to complete the frame transfer and be ready for the next trigger
+        exptime -= pn_preference_int(PROEM_EXPOSURE_SHORTCUT);
+    }
 
     error = set_float_param(internal->model_handle, PicamParameter_ExposureTime, exptime);
     if (error != PicamError_None)
@@ -898,6 +939,11 @@ bool camera_picam_supports_readout_display(Camera *camera, void *internal)
 }
 
 bool camera_picam_supports_shutter_disabling(Camera *camera, void *internal)
+{
+    return true;
+}
+
+bool camera_picam_supports_bias_acquisition(Camera *camera, void *internal)
 {
     return true;
 }

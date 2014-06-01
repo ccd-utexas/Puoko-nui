@@ -47,6 +47,8 @@ typedef struct
 
     bool has_timestamp;
     double timestamp;
+    double readout_time;
+    double vertical_shift_us;
 
     bool has_image_region;
     bool has_bias_region;
@@ -56,6 +58,12 @@ typedef struct
     char *port_desc;
     char *speed_desc;
     char *gain_desc;
+
+    bool has_em_gain;
+    double em_gain;
+
+    bool has_exposure_shortcut;
+    uint16_t exposure_shortcut_ms;
 } CameraFrame;
 
 void pn_log(const char * format, ...);

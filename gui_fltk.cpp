@@ -173,8 +173,14 @@ void FLTKGui::updateTimerGroup()
     else
     {
         // No valid timestamp
-        m_timerUTCTimeOutput->value("NA");
-        m_timerUTCDateOutput->value("NA");
+        m_timerUTCTimeOutput->value("N/A");
+        m_timerUTCDateOutput->value("N/A");
+    }
+
+    if (cached_trigger_mode == TRIGGER_BIAS)
+    {
+        m_timerExposureOutput->value("N/A");
+        return;
     }
 
     const char *message = "";
@@ -184,7 +190,7 @@ void FLTKGui::updateTimerGroup()
         case TIMER_READOUT:
         case TIMER_EXPOSING:
         {
-            bool short_exposure = (cached_highres_timing && cached_exposure_time < 5000) || cached_exposure_time < 5;
+            bool short_exposure = (cached_trigger_mode == TRIGGER_MILLISECONDS && cached_exposure_time < 5000) || cached_exposure_time < 5;
 
             if (short_exposure)
                 message = "(Active)";
@@ -214,7 +220,7 @@ void FLTKGui::updateTimerGroup()
     uint16_t total = cached_exposure_time;
     uint16_t total_ms = 0;
 
-    if (cached_highres_timing)
+    if (cached_trigger_mode != TRIGGER_SECONDS)
     {
         progress /= 1000;
         total /= 1000;
@@ -298,6 +304,8 @@ void FLTKGui::updateAcquisitionGroup()
 
     switch (type)
     {
+		// bias is handled separately, so treat it as a dark here.
+		case OBJECT_BIAS:
         case OBJECT_DARK:
             m_acquisitionTargetOutput->value("Dark");
             break;
@@ -311,6 +319,9 @@ void FLTKGui::updateAcquisitionGroup()
 			m_acquisitionTargetOutput->value(object);
             break;
     }
+
+	if (cached_trigger_mode == TRIGGER_BIAS)
+        m_acquisitionTargetOutput->value("Bias");
 
     char buf[100];
 	if (cached_burst_enabled)
@@ -352,13 +363,20 @@ void FLTKGui::buttonAcquirePressed(Fl_Widget* o, void *userdata)
     {
         clear_queued_data(true);
         camera_start_exposure(gui->m_cameraRef, !pn_preference_char(CAMERA_DISABLE_SHUTTER));
-        bool use_monitor = !camera_is_simulated(gui->m_cameraRef) && pn_preference_char(TIMER_MONITOR_LOGIC_OUT);
-        timer_start_exposure(gui->m_timerRef, pn_preference_int(EXPOSURE_TIME), use_monitor);
+
+		if (gui->cached_trigger_mode != TRIGGER_BIAS)
+		{
+        	bool use_monitor = !camera_is_simulated(gui->m_cameraRef) && pn_preference_char(TIMER_MONITOR_LOGIC_OUT);
+        	timer_start_exposure(gui->m_timerRef, pn_preference_int(EXPOSURE_TIME), use_monitor);
+		}
     }
     else if (mode == ACQUIRING)
     {
         camera_stop_exposure(gui->m_cameraRef);
-        timer_stop_exposure(gui->m_timerRef);
+        if (gui->cached_trigger_mode != TRIGGER_BIAS)
+            timer_stop_exposure(gui->m_timerRef);
+        else
+            camera_notify_safe_to_stop(gui->m_cameraRef);
     }
 
     gui->updateButtonGroup();
@@ -477,12 +495,19 @@ void FLTKGui::buttonCameraConfirmPressed(Fl_Widget* o, void *userdata)
     set_int(CAMERA_WINDOW_Y, (int)(gui->m_cameraWindowY->value()));
     set_int(CAMERA_WINDOW_WIDTH, (int)(gui->m_cameraWindowWidth->value()));
     set_int(CAMERA_WINDOW_HEIGHT, (int)(gui->m_cameraWindowHeight->value()));
-    set_char(CAMERA_DISABLE_SHUTTER, (uint8_t)(gui->m_cameraDisableShutterCheckbox->value()));
+
+	if (camera_supports_shutter_disabling(gui->m_cameraRef))
+    	set_char(CAMERA_DISABLE_SHUTTER, (uint8_t)(gui->m_cameraShutterInput->value()));
 
     set_char(CAMERA_BINNING, (uint8_t)(gui->m_cameraBinningSpinner->value()));
-    set_int(EXPOSURE_TIME, (uint16_t)(gui->m_cameraExposureSpinner->value()));
-    set_char(TIMER_HIGHRES_TIMING, (uint8_t)(gui->m_cameraHighResTimingCheckbox->value()));
-    gui->cached_highres_timing = pn_preference_char(TIMER_HIGHRES_TIMING);
+
+    set_char(TIMER_TRIGGER_MODE, (uint8_t)(gui->m_cameraTimingModeInput->value()));
+    gui->cached_trigger_mode = pn_preference_char(TIMER_TRIGGER_MODE);
+
+	if (gui->cached_trigger_mode != TRIGGER_BIAS)
+    	set_int(EXPOSURE_TIME, (uint16_t)(gui->m_cameraExposureSpinner->value()));
+
+	set_char(TIMER_ALIGN_FIRST_EXPOSURE, (uint8_t)(gui->m_timerAlignFirstExposureCheckbox->value()));
 
     camera_update_settings(gui->m_cameraRef);
     gui->updateAcquisitionGroup();
@@ -527,33 +552,85 @@ void FLTKGui::cameraPortSpeedGainChangedCallback(Fl_Widget *input, void *userdat
     gui->cameraRebuildPortTree(port_id, speed_id, gain_id);
 }
 
-void FLTKGui::cameraTimingResolutionChangedCallback(Fl_Widget *input, void *userdata)
+
+uint16_t FLTKGui::findDesiredExposure(FLTKGui *gui, uint8_t new_mode)
+{
+	uint16_t old_exp = gui->m_cameraExposureSpinner->value();
+	uint8_t old_mode = gui->m_cameraCachedTimingMode;
+
+	if (old_mode == TRIGGER_BIAS)
+	{
+		// Restore the stashed values
+		old_exp = gui->m_cameraCachedPreBiasExposure;
+		old_mode = gui->m_cameraCachedPreBiasType;
+	}
+
+	if (old_mode == new_mode)
+		return old_exp;
+
+	if (old_mode == TRIGGER_MILLISECONDS)
+	{
+		// ms -> s: Round up to the next second
+		return (uint16_t)((uint32_t)(old_exp + 999) / 1000);
+	}
+	else if (old_mode == TRIGGER_SECONDS)
+	{
+		// s -> ms: Limit at max exposure length instead of overflowing
+		return (uint16_t)fmin(65535, (uint32_t)(old_exp * 1000));
+	}
+
+	return old_exp;
+}
+
+void FLTKGui::cameraTimingModeChangedCallback(Fl_Widget *input, void *userdata)
 {
     FLTKGui* gui = (FLTKGui *)userdata;
+	uint8_t mode = gui->m_cameraTimingModeInput->value();
 
-    const char *expstring = gui->m_cameraHighResTimingCheckbox->value() ? "Exposure (ms):" : "Exposure (s):";
+    const char *expstring = mode == TRIGGER_SECONDS ? "Exposure (s):" : "Exposure (ms):";
     gui->m_cameraExposureSpinner->label(expstring);
+
+	if (mode == TRIGGER_BIAS)
+	{
+		gui->m_cameraCachedPreBiasExposure = gui->m_cameraExposureSpinner->value();
+		gui->m_cameraCachedPreBiasType = gui->m_cameraCachedTimingMode;
+
+		gui->m_cameraExposureSpinner->deactivate();
+		gui->m_timerAlignFirstExposureCheckbox->deactivate();
+		gui->m_cameraExposureSpinner->value(0);
+		gui->m_metadataFrameTypeInput->value(OBJECT_BIAS);
+	}
+	else
+	{
+		gui->m_cameraExposureSpinner->activate();
+		gui->m_timerAlignFirstExposureCheckbox->activate();
+		gui->m_cameraExposureSpinner->value(findDesiredExposure(gui, mode));
+		gui->m_metadataFrameTypeInput->value(pn_preference_char(OBJECT_TYPE));
+	}
+
+	gui->m_cameraCachedTimingMode = mode;
+	metadataFrameTypeChangedCallback(gui->m_metadataFrameTypeInput, gui);
 }
 
 void FLTKGui::createCameraWindow()
 {
-    m_cameraWindow = new Fl_Double_Window(370, 205, "Set Camera Parameters");
+    m_cameraWindow = new Fl_Double_Window(395, 230, "Set Camera Parameters");
     m_cameraWindow->user_data((void*)(this));
 
-    Fl_Group *readoutGroup = new Fl_Group(10, 10, 350, 80, "Readout Geometry");
+    Fl_Group *readoutGroup = new Fl_Group(10, 10, 375, 80, "Readout Geometry");
     readoutGroup->box(FL_ENGRAVED_BOX);
     readoutGroup->align(FL_ALIGN_INSIDE|FL_ALIGN_TOP);
     readoutGroup->labelsize(14);
     readoutGroup->labelfont(FL_BOLD);
 
-    int x = 20, y = 35, h = 20, w = 55, margin = 25;
+    int x = 20, y = 35, h = 20, w = 65, margin = 25;
     m_cameraWindowX = new Fl_Spinner(90, y, w, 20, "x,y (px):");
-    m_cameraWindowY = new Fl_Spinner(167, y, w, 20, ",  ");
+    m_cameraWindowY = new Fl_Spinner(177, y, w, 20, ",  ");
     y += margin;
     m_cameraWindowWidth = new Fl_Spinner(90, y, w, 20, "Size (px):");
-    m_cameraWindowHeight = new Fl_Spinner(167, y, w, 20, " x ");
+    m_cameraWindowHeight = new Fl_Spinner(177, y, w, 20, " x ");
 
-    m_cameraBinningSpinner = new Fl_Spinner(300, y, 50, 20, "Bin (px):");
+    m_cameraBinningSpinner = new Fl_Spinner(325, y, 50, 20, "Bin (px):");
     m_cameraBinningSpinner->maximum(255);
     m_cameraBinningSpinner->minimum(1);
 
@@ -572,23 +649,31 @@ void FLTKGui::createCameraWindow()
     m_cameraGainInput->callback(cameraPortSpeedGainChangedCallback);
     m_cameraGainInput->user_data((void*)(this));
 
-    m_cameraDisableShutterCheckbox = new Fl_Check_Button(x - 40, y, w + 50, h, "Keep shutter closed"); y += margin;
-	if (!camera_supports_shutter_disabling(m_cameraRef))
-		m_cameraDisableShutterCheckbox->hide();
+	m_cameraShutterInput = new Fl_Choice(x, y, w, h, "Shutter:"); y += margin;
+    m_cameraShutterInput->user_data((void*)(this));
+    m_cameraShutterInput->add("Open");
+    m_cameraShutterInput->add("Closed");
+	m_cameraShutterInput->add("N\\/A", 0, 0, 0, FL_MENU_INVISIBLE);
 
-    x = 295; y = 100; w = 65;
+    x = 295; y = 100; w = 90;
 
     m_cameraTemperatureInput = new Fl_Float_Input(x, y, w, h, "Temp. (\u00B0C):"); y += margin;
+
+	m_cameraTimingModeInput = new Fl_Choice(x, y, w, h, "Trigger Type:"); y += margin;
+    m_cameraTimingModeInput->callback(cameraTimingModeChangedCallback);
+    m_cameraTimingModeInput->user_data((void*)(this));
+    m_cameraTimingModeInput->add("Low Res");
+    m_cameraTimingModeInput->add("High Res");
+	if (camera_supports_bias_acquisition(m_cameraRef))
+    	m_cameraTimingModeInput->add("Bias");
 
     m_cameraExposureSpinner = new Fl_Spinner(x, y, w, h, ""); y += margin;
     m_cameraExposureSpinner->maximum(65535);
     m_cameraExposureSpinner->minimum(1);
 
-    m_cameraHighResTimingCheckbox = new Fl_Check_Button(x - 110, y, w + 110, h, "High-resolution timing"); y += margin;
-    m_cameraHighResTimingCheckbox->callback(cameraTimingResolutionChangedCallback);
-    m_cameraHighResTimingCheckbox->user_data((void*)(this));
+	m_timerAlignFirstExposureCheckbox = new Fl_Check_Button(x - 75, y, w + 75, h, "Align first exposure"); y += margin;
 
-    x = 240; w = 120;
+    x = 265; w = 120;
     m_cameraButtonConfirm = new Fl_Button(x, y, w, h, "Save");
     m_cameraButtonConfirm->user_data((void*)(this));
     m_cameraButtonConfirm->callback(buttonCameraConfirmPressed);
@@ -602,7 +687,8 @@ void FLTKGui::showCameraWindow()
     uint8_t gain_id = pn_preference_char(CAMERA_GAIN_MODE);
     cameraRebuildPortTree(port_id, speed_id, gain_id);
 
-    m_cameraExposureSpinner->value(pn_preference_int(EXPOSURE_TIME));
+	m_cameraCachedPreBiasExposure = pn_preference_int(EXPOSURE_TIME);
+    m_cameraExposureSpinner->value(m_cameraCachedPreBiasExposure);
     m_cameraBinningSpinner->value(pn_preference_char(CAMERA_BINNING));
 
     // Useable chip region xmin,xmax, ymin,ymax
@@ -628,9 +714,18 @@ void FLTKGui::showCameraWindow()
     snprintf(buf, 32, "%.2f", pn_preference_int(CAMERA_TEMPERATURE) / 100.0);
     m_cameraTemperatureInput->value(buf);
 
-    m_cameraDisableShutterCheckbox->value(pn_preference_char(CAMERA_DISABLE_SHUTTER));
-    m_cameraHighResTimingCheckbox->value(pn_preference_char(TIMER_HIGHRES_TIMING));
-    cameraTimingResolutionChangedCallback(m_cameraHighResTimingCheckbox, this);
+	m_cameraCachedTimingMode = m_cameraCachedPreBiasType = pn_preference_char(TIMER_TRIGGER_MODE);
+    m_cameraTimingModeInput->value(gui->m_cameraCachedTimingMode);
+    cameraTimingModeChangedCallback(m_cameraTimingModeInput, this);
+
+    m_cameraShutterInput->value(pn_preference_char(CAMERA_DISABLE_SHUTTER));
+	if (!camera_supports_shutter_disabling(m_cameraRef))
+	{
+		m_cameraShutterInput->deactivate();
+		m_cameraShutterInput->value(2);
+	}
+
+    m_timerAlignFirstExposureCheckbox->value(pn_preference_char(TIMER_ALIGN_FIRST_EXPOSURE));
 
     m_cameraWindow->show();
 }
@@ -681,8 +776,9 @@ void FLTKGui::metadataAcquisitionTypeChangedCallback(Fl_Widget *input, void *use
 void FLTKGui::metadataFrameTypeChangedCallback(Fl_Widget *input, void *userdata)
 {
 	FLTKGui *gui = (FLTKGui *)userdata;
+	uint8_t type = ((Fl_Choice *)input)->value();
 
-    if (((Fl_Choice *)input)->value() == OBJECT_TARGET)
+    if (type == OBJECT_TARGET)
 	{
 	    populate_string_preference(gui->m_metadataTargetInput, OBJECT_NAME);
 		gui->m_metadataTargetInput->activate();
@@ -692,6 +788,11 @@ void FLTKGui::metadataFrameTypeChangedCallback(Fl_Widget *input, void *userdata)
 		gui->m_metadataTargetInput->value("N/A");
 		gui->m_metadataTargetInput->deactivate();
 	}
+
+	if (type == OBJECT_BIAS)
+		gui->m_metadataFrameTypeInput->deactivate();
+	else
+		gui->m_metadataFrameTypeInput->activate();
 }
 
 void FLTKGui::createMetadataWindow()
@@ -735,6 +836,7 @@ void FLTKGui::createMetadataWindow()
     m_metadataFrameTypeInput->add("Flat");
     m_metadataFrameTypeInput->add("Focus");
     m_metadataFrameTypeInput->add("Target");
+	m_metadataFrameTypeInput->add("Bias", 0, 0, 0, FL_MENU_INVISIBLE);
     m_metadataFrameTypeInput->callback(metadataFrameTypeChangedCallback);
     m_metadataFrameTypeInput->user_data((void*)(this));
 
@@ -774,6 +876,9 @@ void FLTKGui::showMetadataWindow()
 	metadataAcquisitionTypeChangedCallback(m_metadataAcquistionInput, this);
 
     uint8_t object_type = pn_preference_char(OBJECT_TYPE);
+	if (cached_trigger_mode == TRIGGER_BIAS)
+		object_type = OBJECT_BIAS;
+
     m_metadataFrameTypeInput->value(object_type);
 	metadataFrameTypeChangedCallback(m_metadataFrameTypeInput, this);
 
@@ -813,9 +918,12 @@ void FLTKGui::buttonMetadataConfirmPressed(Fl_Widget* o, void *userdata)
     	set_int(BURST_COUNTDOWN, burst_countdown);
 
 	uint8_t object_type = gui->m_metadataFrameTypeInput->value();
-    pn_preference_set_char(OBJECT_TYPE, object_type);
-	if (object_type == OBJECT_TARGET)
-    	set_string(OBJECT_NAME, gui->m_metadataTargetInput->value());
+	if (object_type != OBJECT_BIAS)
+	{
+    	pn_preference_set_char(OBJECT_TYPE, object_type);
+		if (object_type == OBJECT_TARGET)
+    		set_string(OBJECT_NAME, gui->m_metadataTargetInput->value());
+	}
 
     set_string(OBSERVERS, gui->m_metadataObserversInput->value());
     set_string(OBSERVATORY, gui->m_metadataObservatoryInput->value());
@@ -991,7 +1099,7 @@ FLTKGui::FLTKGui(Camera *camera, TimerUnit *timer)
     cached_timer_mode = timer_mode(timer);
     cached_camera_readout = camera_readout_time(m_cameraRef);
     cached_exposure_time = pn_preference_int(EXPOSURE_TIME);
-    cached_highres_timing = pn_preference_char(TIMER_HIGHRES_TIMING);
+    cached_trigger_mode = pn_preference_char(TIMER_TRIGGER_MODE);
     cached_readout_display = camera_supports_readout_display(m_cameraRef);
 
     updateTimerGroup();

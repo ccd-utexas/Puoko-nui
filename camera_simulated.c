@@ -25,8 +25,10 @@ struct internal
     uint16_t frame_height;
 
     // Number of queued frames to generate
+    bool acquiring;
     size_t queued_frames;
     pthread_mutex_t queue_mutex;
+    TimerTimestamp bias_last_updated;
 
     // String descriptions to store in frame headers
     char *current_port_desc;
@@ -178,17 +180,23 @@ int camera_simulated_uninitialize(Camera *camera, void *_internal)
 
 int camera_simulated_start_acquiring(Camera *camera, void *_internal, bool shutter_open)
 {
+    struct internal *internal = _internal;
+
     // Wait a bit to simulate hardware delays
     millisleep(2000);
     pn_log("%s simulated shutter.", shutter_open ? "Opened" : "Closed");
+    internal->acquiring = true;
     return CAMERA_OK;
 }
 
 int camera_simulated_stop_acquiring(Camera *camera, void *_internal)
 {
+    struct internal *internal = _internal;
+
     // Wait a bit to simulate hardware delays
     millisleep(1000);
     pn_log("Closed simulated shutter.");
+    internal->acquiring = false;
     return CAMERA_OK;
 }
 
@@ -205,6 +213,18 @@ int camera_simulated_tick(Camera *camera, void *_internal, PNCameraMode current_
     pthread_mutex_lock(&internal->queue_mutex);
     size_t queued = internal->queued_frames;
     internal->queued_frames = 0;
+
+    if (internal->acquiring && pn_preference_char(TIMER_TRIGGER_MODE) == TRIGGER_BIAS)
+    {
+        // Simulate a new bias every 100ms
+        TimerTimestamp bias_updated = system_time();
+        double dt = (timestamp_to_unixtime(&bias_updated) - timestamp_to_unixtime(&internal->bias_last_updated));
+        if (dt >= 0.1)
+        {
+            queued++;
+            internal->bias_last_updated = bias_updated;
+        }
+    }
     pthread_mutex_unlock(&internal->queue_mutex);
 
     for (size_t i = 0; i < queued; i++)
@@ -237,6 +257,9 @@ int camera_simulated_tick(Camera *camera, void *_internal, PNCameraMode current_
                 frame->height = internal->frame_height;
                 camera_simulated_read_temperature(camera, internal, &frame->temperature);
 
+                frame->readout_time = 0;
+                frame->vertical_shift_us = 0;
+
                 frame->has_timestamp = false;
                 frame->has_image_region = false;
                 frame->has_bias_region = false;
@@ -244,6 +267,8 @@ int camera_simulated_tick(Camera *camera, void *_internal, PNCameraMode current_
                 frame->port_desc = strdup(internal->current_port_desc);
                 frame->speed_desc = strdup(internal->current_speed_desc);
                 frame->gain_desc = strdup(internal->current_gain_desc);
+                frame->has_em_gain = false;
+                frame->has_exposure_shortcut = false;
 
                 queue_framedata(frame);
             }
@@ -267,11 +292,16 @@ bool camera_simulated_supports_shutter_disabling(Camera *camera, void *internal)
     return true;
 }
 
+bool camera_simulated_supports_bias_acquisition(Camera *camera, void *internal)
+{
+    return true;
+}
+
 void camera_simulated_normalize_trigger(Camera *camera, void *internal, TimerTimestamp *trigger)
 {
     // Convert trigger time from end of exposure to start of exposure
     uint16_t exposure = pn_preference_int(EXPOSURE_TIME);
-    if (pn_preference_char(TIMER_HIGHRES_TIMING))
+    if (pn_preference_char(TIMER_TRIGGER_MODE) != TRIGGER_SECONDS)
     {
         trigger->seconds -= exposure / 1000;
         trigger->milliseconds -= exposure % 1000;
